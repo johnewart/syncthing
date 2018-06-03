@@ -10,10 +10,13 @@ type FilesystemType int
 
 const (
 	FilesystemTypeBasic FilesystemType = iota // default is basic
+	FilesystemTypeS3    FilesystemType = iota
 )
 
 func (t FilesystemType) String() string {
 	switch t {
+	case FilesystemTypeS3:
+		return "s3"
 	case FilesystemTypeBasic:
 		return "basic"
 	default:
@@ -27,6 +30,8 @@ func (t FilesystemType) MarshalText() ([]byte, error) {
 
 func (t *FilesystemType) UnmarshalText(bs []byte) error {
 	switch string(bs) {
+	case "s3":
+		*t = FilesystemTypeS3
 	case "basic":
 		*t = FilesystemTypeBasic
 	default:

@@ -160,6 +160,8 @@ var IsPathSeparator = os.IsPathSeparator
 func NewFilesystem(fsType FilesystemType, uri string) Filesystem {
 	var fs Filesystem
 	switch fsType {
+	case FilesystemTypeS3:
+		fs = newS3Filesystem(uri)
 	case FilesystemTypeBasic:
 		fs = newBasicFilesystem(uri)
 	default:

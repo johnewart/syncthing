@@ -382,6 +382,7 @@ func setup() {
 		"honnef.co/go/tools/cmd/staticcheck",
 		"honnef.co/go/tools/cmd/unused",
 		"github.com/josephspurrier/goversioninfo",
+		"github.com/aws/aws-sdk-go",
 	}
 	for _, pkg := range packages {
 		fmt.Println(pkg)
