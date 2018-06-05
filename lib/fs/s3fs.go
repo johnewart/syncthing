@@ -139,6 +139,7 @@ func (f *S3Filesystem) Mkdir(name string, perm FileMode) error {
 // If path is already a directory, MkdirAll does nothing and returns nil.
 func (f *S3Filesystem) MkdirAll(path string, perm FileMode) error {
 	fmt.Printf("S3FS MkdirAll: %s\n", path)
+	f.Mkdir(path, perm)
 	return nil
 }
 
@@ -263,7 +264,7 @@ func (f *S3Filesystem) DirNames(name string) ([]string, error) {
 
 		for _, o := range resp.Contents {
 			if *o.Key != dirPrefix {
-				dirKey := s3rel(*o.Key, f.keyPrefix)
+				dirKey := s3rel(*o.Key, dirPrefix)
 				fmt.Printf("S3Dir found: %s\n", dirKey)
 				directories = append(directories, dirKey)
 			}
@@ -280,7 +281,7 @@ func (f *S3Filesystem) Open(name string) (File, error) {
 
 	fmt.Printf("S3FS Open %s -> %s\n", name, rootedName)
 
-	handle := s3File{
+	handle := &s3File{
 		bucket: f.bucket,
 		name:   name,
 		key:    rootedName,
@@ -301,7 +302,7 @@ func (f *S3Filesystem) OpenFile(name string, flags int, mode FileMode) (File, er
 	rootedName := f.rooted(name)
 
 	// Just return a handle to it
-	return s3File{
+	return &s3File{
 		bucket: f.bucket,
 		name:   name,
 		key:    rootedName,
@@ -315,7 +316,7 @@ func (f *S3Filesystem) Create(name string) (File, error) {
 	rootedName := f.rooted(name)
 
 	// Just return a handle to it
-	return s3File{
+	return &s3File{
 		bucket: f.bucket,
 		name:   name,
 		key:    rootedName,
@@ -365,11 +366,13 @@ func (f *S3Filesystem) Watch(path string, ignore Matcher, ctx context.Context, i
 }
 
 func (f *S3Filesystem) Type() FilesystemType {
-	return FilesystemTypeBasic
+	return FilesystemTypeS3
 }
 
 func (f *S3Filesystem) URI() string {
-	return "s3://" + f.bucket + "/" + f.keyPrefix + "/"
+	uri := "s3://" + f.bucket + "/" + f.keyPrefix + "/"
+	fmt.Printf("URI FOR FILESYSTEM: %s\n", uri)
+	return uri
 }
 
 func (f *S3Filesystem) SameFile(fi1, fi2 FileInfo) bool {
@@ -387,6 +390,7 @@ func (f *S3Filesystem) SameFile(fi1, fi2 FileInfo) bool {
 
 // s3File implements the fs.File interface on top of an S3 object
 type s3File struct {
+	*os.File
 	bucket string
 	name   string
 	client *s3.S3
@@ -394,22 +398,55 @@ type s3File struct {
 	offset int64
 }
 
-func (f s3File) Name() string {
+func (f *s3File) Name() string {
 	return f.name
 }
 
-func (f s3File) Close() error {
+func (f *s3File) Close() error {
+	fmt.Printf("S3 Close: %s\n", f.key)
 	return nil
 }
 
-func (f s3File) Stat() (FileInfo, error) {
+func (f *s3File) Stat() (FileInfo, error) {
 	fmt.Printf("S3 Stat: %s\n", f.name)
 	return s3stat(f.client, f.bucket, f.key, f.name)
 }
 
+// Cache these?
+func (f *s3File) FetchBlocks(offset, nBytes int) []byte {
+	startBlock = offset / 128000
+	endBlock = (offset + nBytes) / 128000
+	downloader := s3manager.NewDownloaderWithClient(f.client)
+	buff := &aws.WriteAtBuffer{}
+	for blockId := startBlock; blockId < endBlock; blockId++ {
+		blockKey := fmt.Sprintf(".blocks/%s.%d", f.key, blockId)
+		fmt.Printf("Fetching block %s\n", blockKey)
+
+		_, err := downloader.Download(buff, &s3.GetObjectInput{
+			Bucket: aws.String(f.bucket),
+			Key:    aws.String(blockKey),
+		})
+
+		if err != nil {
+			if aerr, ok := err.(awserr.Error); ok {
+				fmt.Printf("Error code getting block: %s\n", aerr.Code())
+			}
+		}
+	}
+
+	return buff.Bytes()
+}
+
+func (f *S3File) WriteBlocks(offset int, buf []byte) {
+	startBlock = offset / 128000
+	endBlock = (offset + len(buf)) / 128000
+
+}
+
 // This is stupid; there's no seek / fpntr for these... guess we may need that
-func (f s3File) Read(buf []byte) (int, error) {
+func (f *s3File) Read(buf []byte) (int, error) {
 	fmt.Printf("S3 Read: %s as %s from %s starting at %d\n", f.name, f.key, f.bucket, f.offset)
+	blockBuff := f.FetchBlocks(f.offset, len(buf))
 	numBytes, err := f.ReadAt(buf, f.offset)
 
 	if err != nil {
@@ -430,7 +467,7 @@ func (f s3File) Read(buf []byte) (int, error) {
 	return int(numBytes), err
 }
 
-func (f s3File) ReadAt(buf []byte, off int64) (n int, err error) {
+func (f *s3File) ReadAt(buf []byte, off int64) (n int, err error) {
 	fmt.Printf("S3 ReadAt: %s\n", f.name)
 	bytes := len(buf)
 	endByte := off + int64(bytes)
@@ -448,20 +485,20 @@ func (f s3File) ReadAt(buf []byte, off int64) (n int, err error) {
 	return int(numBytes), err
 }
 
-func (f s3File) Seek(offset int64, whence int) (ret int64, err error) {
+func (f *s3File) Seek(offset int64, whence int) (ret int64, err error) {
 	fmt.Printf("S3 Seek: %s\n", f.name)
 	return 0, nil
 }
 
-func (f s3File) Sync() error {
+func (f *s3File) Sync() error {
 	return nil
 }
 
-func (f s3File) Truncate(size int64) error {
+func (f *s3File) Truncate(size int64) error {
 	return nil
 }
 
-func (f s3File) Write(buff []byte) (n int, err error) {
+func (f *s3File) Write(buff []byte) (n int, err error) {
 	fmt.Printf("S3 Write: %s\n", f.name)
 	dataLen := len(buff)
 	buffReader := bytes.NewReader(buff)
@@ -485,7 +522,7 @@ func (f s3File) Write(buff []byte) (n int, err error) {
 
 // TODO: Optimize this by instead writing files as blocks so we don't need
 // to fetch the whole thing and overwrite part of it; this whole thing is terribly ineffective...
-func (f s3File) WriteAt(buff []byte, off int64) (n int, err error) {
+func (f *s3File) WriteAt(buff []byte, off int64) (n int, err error) {
 	dataLen := len(buff)
 	end := int(off) + int(dataLen)
 	fmt.Printf("S3 WriteAt: %s %d-%d (%d bytes)\n", f.name, off, end, dataLen)
@@ -511,7 +548,7 @@ func (f s3File) WriteAt(buff []byte, off int64) (n int, err error) {
 	return dataLen, nil
 }
 
-func (f s3File) Exists() bool {
+func (f *s3File) Exists() bool {
 
 	fmt.Printf("Checking if %s exists\n", f.key)
 
@@ -542,6 +579,7 @@ func (fs s3FileStat) IsDir() bool        { return fs.isDirectory }
 func (fs s3FileStat) ModTime() time.Time { return fs.modTime }
 func (fs s3FileStat) Mode() FileMode     { return fs.mode }
 func (fs s3FileStat) Size() int64        { return fs.size }
+func (fs s3FileStat) BlockSize() int64   { return 1024000 }
 
 func (e s3FileStat) IsSymlink() bool {
 	// Must use s3FileInfo.Mode() because it may apply magic.
