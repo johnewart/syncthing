@@ -6,6 +6,7 @@
 package fs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -196,24 +197,30 @@ func (f *S3Filesystem) RemoveAll(name string) error {
 }
 
 func (f *S3Filesystem) Rename(oldpath, newpath string) error {
+
+	fmt.Printf("S3FS Rename %s -> %s\n", oldpath, newpath)
 	src := f.rooted(oldpath)
 	target := f.rooted(newpath)
 
+	copySrc := fmt.Sprintf("%s/%s", f.bucket, src)
+
 	input := &s3.CopyObjectInput{
 		Bucket:     aws.String(f.bucket),
-		CopySource: aws.String(src),
+		CopySource: aws.String(copySrc),
 		Key:        aws.String(target),
 	}
 
 	// copy first
+	fmt.Printf("S3FS Copying %s -> %s\n", copySrc, target)
 	_, err := f.client.CopyObject(input)
 	if err != nil {
 		return err
 	}
 
+	fmt.Printf("S3FS Removing %s\n", src)
 	_, err = f.client.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(f.bucket),
-		Key:    aws.String(oldpath),
+		Key:    aws.String(src),
 	})
 
 	if err != nil {
@@ -234,6 +241,8 @@ func (f *S3Filesystem) DirNames(name string) ([]string, error) {
 
 	if name == "." {
 		dirPrefix = f.keyPrefix + "/"
+	} else {
+		dirPrefix = dirPrefix + "/"
 	}
 
 	fmt.Printf("S3FS DirNames: %s from %s\n", name, dirPrefix)
@@ -253,10 +262,9 @@ func (f *S3Filesystem) DirNames(name string) ([]string, error) {
 		}
 
 		for _, o := range resp.Contents {
-			dirKey := s3rel(*o.Key, f.keyPrefix)
-			fmt.Printf("S3Dir found: %s\n", dirKey)
-			if dirKey != "" && dirKey != name {
-				fmt.Printf("S3Dir adding: %s\n", dirKey)
+			if *o.Key != dirPrefix {
+				dirKey := s3rel(*o.Key, f.keyPrefix)
+				fmt.Printf("S3Dir found: %s\n", dirKey)
 				directories = append(directories, dirKey)
 			}
 		}
@@ -277,6 +285,7 @@ func (f *S3Filesystem) Open(name string) (File, error) {
 		name:   name,
 		key:    rootedName,
 		client: f.client,
+		offset: 0,
 	}
 
 	if !handle.Exists() {
@@ -297,6 +306,7 @@ func (f *S3Filesystem) OpenFile(name string, flags int, mode FileMode) (File, er
 		name:   name,
 		key:    rootedName,
 		client: f.client,
+		offset: 0,
 	}, nil
 }
 
@@ -310,6 +320,7 @@ func (f *S3Filesystem) Create(name string) (File, error) {
 		name:   name,
 		key:    rootedName,
 		client: f.client,
+		offset: 0,
 	}, nil
 }
 
@@ -339,11 +350,12 @@ func (f *S3Filesystem) Glob(pattern string) ([]string, error) {
 	return unrooted, err
 }
 
+// TODO: Compute / cache / update actual usage size?
 func (f *S3Filesystem) Usage(name string) (Usage, error) {
 	name = f.rooted(name)
 	return Usage{
-		Free:  100000,
-		Total: 100000,
+		Free:  9223372036854775807,
+		Total: 0,
 	}, nil
 }
 
@@ -379,6 +391,7 @@ type s3File struct {
 	name   string
 	client *s3.S3
 	key    string
+	offset int64
 }
 
 func (f s3File) Name() string {
@@ -394,15 +407,25 @@ func (f s3File) Stat() (FileInfo, error) {
 	return s3stat(f.client, f.bucket, f.key, f.name)
 }
 
+// This is stupid; there's no seek / fpntr for these... guess we may need that
 func (f s3File) Read(buf []byte) (int, error) {
-	fmt.Printf("S3 Read: %s as %s from %s\n", f.name, f.key, f.bucket)
-	buff := aws.NewWriteAtBuffer(buf)
-	downloader := s3manager.NewDownloaderWithClient(f.client)
-	numBytes, err := downloader.Download(buff, &s3.GetObjectInput{
-		Bucket: aws.String(f.bucket),
-		Key:    aws.String(f.key),
-	})
-	fmt.Printf("S3 Read %d bytes", numBytes)
+	fmt.Printf("S3 Read: %s as %s from %s starting at %d\n", f.name, f.key, f.bucket, f.offset)
+	numBytes, err := f.ReadAt(buf, f.offset)
+
+	if err != nil {
+		return 0, err
+	}
+
+	/*
+		buff := aws.NewWriteAtBuffer()
+		downloader := s3manager.NewDownloaderWithClient(f.client)
+		numBytes, err := downloader.Download(buff, &s3.GetObjectInput{
+			Bucket: aws.String(f.bucket),
+			Key:    aws.String(f.key),
+		})*/
+	fmt.Printf("S3 Read %d bytes -- buffer is %d in size\n", numBytes, len(buf))
+	f.offset = f.offset + int64(numBytes)
+	fmt.Printf("Offset is now %d\n", f.offset)
 
 	return int(numBytes), err
 }
@@ -411,7 +434,7 @@ func (f s3File) ReadAt(buf []byte, off int64) (n int, err error) {
 	fmt.Printf("S3 ReadAt: %s\n", f.name)
 	bytes := len(buf)
 	endByte := off + int64(bytes)
-	rangeValue := fmt.Sprintf("%d-%d", off, endByte)
+	rangeValue := fmt.Sprintf("bytes=%d-%d", off, endByte-1)
 	fmt.Printf("RANGE: %s\n", rangeValue)
 	buff := aws.NewWriteAtBuffer(buf)
 	downloader := s3manager.NewDownloaderWithClient(f.client)
@@ -420,11 +443,9 @@ func (f s3File) ReadAt(buf []byte, off int64) (n int, err error) {
 		Key:    aws.String(f.key),
 		Range:  aws.String(rangeValue),
 	})
-	fmt.Printf("S3 Read %d bytes", numBytes)
+	fmt.Printf("S3 Read %d bytes\n", numBytes)
 
 	return int(numBytes), err
-
-	return 0, nil
 }
 
 func (f s3File) Seek(offset int64, whence int) (ret int64, err error) {
@@ -440,14 +461,54 @@ func (f s3File) Truncate(size int64) error {
 	return nil
 }
 
-func (f s3File) Write(b []byte) (n int, err error) {
+func (f s3File) Write(buff []byte) (n int, err error) {
 	fmt.Printf("S3 Write: %s\n", f.name)
-	return 0, nil
+	dataLen := len(buff)
+	buffReader := bytes.NewReader(buff)
+
+	params := &s3.PutObjectInput{
+		Bucket:        aws.String(f.bucket),
+		Key:           aws.String(f.key),
+		Body:          buffReader,
+		ContentLength: aws.Int64(int64(dataLen)),
+	}
+
+	_, err = f.client.PutObject(params)
+	if err != nil {
+		fmt.Printf("S3 Write bad response: %s", err)
+		return 0, err
+	}
+
+	return dataLen, nil
+
 }
 
-func (f s3File) WriteAt(b []byte, off int64) (n int, err error) {
-	fmt.Printf("S3 WriteAt: %s\n", f.name)
-	return 0, nil
+// TODO: Optimize this by instead writing files as blocks so we don't need
+// to fetch the whole thing and overwrite part of it; this whole thing is terribly ineffective...
+func (f s3File) WriteAt(buff []byte, off int64) (n int, err error) {
+	dataLen := len(buff)
+	end := int(off) + int(dataLen)
+	fmt.Printf("S3 WriteAt: %s %d-%d (%d bytes)\n", f.name, off, end, dataLen)
+
+	if !f.Exists() {
+		f.Write(buff)
+	} else {
+		wab := &aws.WriteAtBuffer{}
+		downloader := s3manager.NewDownloaderWithClient(f.client)
+		numBytes, err := downloader.Download(wab, &s3.GetObjectInput{
+			Bucket: aws.String(f.bucket),
+			Key:    aws.String(f.key),
+		})
+
+		if err != nil {
+			return 0, err
+		}
+		fmt.Printf("S3 WriteAt Read %d bytes\n", numBytes)
+		fmt.Printf("Writing %d - %d\n", off, end)
+		wab.WriteAt(buff, off)
+		f.Write(wab.Bytes())
+	}
+	return dataLen, nil
 }
 
 func (f s3File) Exists() bool {
