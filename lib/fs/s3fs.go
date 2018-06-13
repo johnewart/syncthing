@@ -8,6 +8,9 @@ package fs
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
@@ -15,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/google/uuid"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,22 +148,22 @@ func (f *S3Filesystem) MkdirAll(path string, perm FileMode) error {
 }
 
 // Fake stat()
-func (f *S3Filesystem) Lstat(name string) (FileInfo, error) {
+func (fs *S3Filesystem) Lstat(name string) (FileInfo, error) {
 	fmt.Printf("S3 Lstat: %s\n", name)
 	key := name
 
 	if name == "." {
-		key = f.keyPrefix + "/"
+		key = fs.keyPrefix + "/"
 	} else {
-		key = f.rooted(name)
+		key = fs.rooted(name)
 	}
 
 	trimmed := strings.TrimPrefix(filepath.Clean(key), "/")
 
-	if trimmed == f.keyPrefix {
+	if trimmed == fs.keyPrefix {
 		fmt.Printf("Head on %s\n", key)
-		headObj, err := f.client.HeadObject(&s3.HeadObjectInput{
-			Bucket: aws.String(f.bucket),
+		headObj, err := fs.client.HeadObject(&s3.HeadObjectInput{
+			Bucket: aws.String(fs.bucket),
 			Key:    aws.String(key),
 		})
 
@@ -176,7 +180,30 @@ func (f *S3Filesystem) Lstat(name string) (FileInfo, error) {
 		}, nil
 	}
 
-	return (s3stat(f.client, f.bucket, key, name))
+	rootedName := fs.rooted(name)
+	stat, err := s3stat(fs.client, fs.bucket, rootedName, name)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if stat.IsDir() || stat.Size() > 0 {
+		return stat, nil
+	} else {
+		meta, err := fs.GetMetadata(name)
+		if err != nil {
+			return nil, err
+		}
+		st := s3FileStat{
+			name:        stat.Name(),
+			size:        meta.Size,
+			mode:        0777,
+			isDirectory: stat.IsDir(),
+			modTime:     stat.ModTime(),
+		}
+		return st, nil
+	}
+
 }
 
 func (f *S3Filesystem) Remove(name string) error {
@@ -228,11 +255,40 @@ func (f *S3Filesystem) Rename(oldpath, newpath string) error {
 		return err
 	}
 
+	// Move metadata
+	srcMetadataKey := fmt.Sprintf(".metadata/%s", src)
+	tgtMetadataKey := fmt.Sprintf(".metadata/%s", target)
+	copyMetadataSrc := fmt.Sprintf("%s/%s", f.bucket, srcMetadataKey)
+
+	mdInput := &s3.CopyObjectInput{
+		Bucket:     aws.String(f.bucket),
+		CopySource: aws.String(copyMetadataSrc),
+		Key:        aws.String(tgtMetadataKey),
+	}
+
+	// copy first
+	fmt.Printf("S3FS Copying %s -> %s\n", copyMetadataSrc, tgtMetadataKey)
+	_, err = f.client.CopyObject(mdInput)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("S3FS Removing %s\n", srcMetadataKey)
+	_, err = f.client.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(f.bucket),
+		Key:    aws.String(srcMetadataKey),
+	})
+
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (f *S3Filesystem) Stat(name string) (FileInfo, error) {
 	fmt.Printf("S3FS Stat: %s\n", name)
+
 	return f.Lstat(name)
 }
 
@@ -276,53 +332,105 @@ func (f *S3Filesystem) DirNames(name string) ([]string, error) {
 	return directories, nil
 }
 
+func (fs *S3Filesystem) GetMetadata(name string) (*s3FileMetadata, error) {
+	rootedName := fs.rooted(name)
+	fmt.Printf("S3FS GetMetadata for %s\n", rootedName)
+	metadataKey := fmt.Sprintf(".metadata/%s", rootedName)
+	metadataBuff := &aws.WriteAtBuffer{}
+	fmt.Printf("Fetching metadata file %s for %s\n", metadataKey, rootedName)
+	downloader := s3manager.NewDownloaderWithClient(fs.client)
+	_, err := downloader.Download(metadataBuff, &s3.GetObjectInput{
+		Bucket: aws.String(fs.bucket),
+		Key:    aws.String(metadataKey),
+	})
+
+	var metadata s3FileMetadata
+	err = json.Unmarshal(metadataBuff.Bytes(), &metadata)
+
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("Loaded metadata: %s\n", metadata)
+
+	return &metadata, nil
+}
+
 func (f *S3Filesystem) Open(name string) (File, error) {
+	return f.OpenFile(name, os.O_RDONLY, 0755)
+}
+
+// TODO check if it only contains a block pointer, if not convert to blocks
+func (f *S3Filesystem) OpenFile(name string, flags int, mode FileMode) (File, error) {
+	fmt.Printf("S3FS OpenFile: %s with flags %s and mode %s\n", name, flags, mode)
 	rootedName := f.rooted(name)
 
-	fmt.Printf("S3FS Open %s -> %s\n", name, rootedName)
-
-	handle := &s3File{
-		bucket: f.bucket,
-		name:   name,
-		key:    rootedName,
-		client: f.client,
-		offset: 0,
+	if flags&os.O_CREATE != 0 {
+		fmt.Printf("Creating file %s\n", name)
 	}
 
-	if !handle.Exists() {
-		return nil, os.ErrNotExist
+	// TODO don't reset offset...
+	// Just return a handle to it
+	handle := &s3File{
+		bucket:    f.bucket,
+		name:      name,
+		key:       rootedName,
+		client:    f.client,
+		offset:    0,
+		blockName: "",
+		size:      0,
+	}
+
+	stat, err := s3stat(f.client, f.bucket, rootedName, name)
+
+	if err != os.ErrNotExist && !stat.IsDir() {
+		if stat.Size() == 0 {
+			// Using blocks
+			metadata, _ := f.GetMetadata(name)
+			handle.blockName = metadata.BlockName
+			handle.size = metadata.Size
+		} else {
+			// Migrate to blocks...
+			fmt.Printf("File exists but doesn't only contain only a block id, need to migrate it...\n")
+			handle.blockName = GetMD5Hash(rootedName)
+			// TODO Stream blocks
+			downloader := s3manager.NewDownloaderWithClient(f.client)
+			buff := &aws.WriteAtBuffer{}
+			fmt.Printf("Fetching file %s\n", rootedName)
+
+			_, err := downloader.Download(buff, &s3.GetObjectInput{
+				Bucket: aws.String(f.bucket),
+				Key:    aws.String(rootedName),
+			})
+
+			if err != nil {
+				return nil, err
+			}
+
+			handle.Write(buff.Bytes())
+			handle.WriteMetadata()
+			handle.WritePlaceholder()
+			fmt.Printf("Migrated to blocks as %s -> %s\n", handle.key, handle.blockName)
+		}
+	} else {
+		// Doesn't exist
+		// Opened with CREATE, write out a file descriptor
+		if flags&os.O_CREATE != 0 {
+			// TODO UUID
+			handle.blockName = GetMD5Hash(rootedName)
+			handle.WriteMetadata()
+			handle.WritePlaceholder()
+		} else {
+			// Wasn't to be created, error that it doesn't exist
+			return nil, os.ErrNotExist
+		}
 	}
 
 	return handle, nil
 }
 
-func (f *S3Filesystem) OpenFile(name string, flags int, mode FileMode) (File, error) {
-	fmt.Printf("S3FS OpenFile: %s\n", name)
-
-	rootedName := f.rooted(name)
-
-	// Just return a handle to it
-	return &s3File{
-		bucket: f.bucket,
-		name:   name,
-		key:    rootedName,
-		client: f.client,
-		offset: 0,
-	}, nil
-}
-
 func (f *S3Filesystem) Create(name string) (File, error) {
 	fmt.Printf("S3FS Create: %s\n", name)
-	rootedName := f.rooted(name)
-
-	// Just return a handle to it
-	return &s3File{
-		bucket: f.bucket,
-		name:   name,
-		key:    rootedName,
-		client: f.client,
-		offset: 0,
-	}, nil
+	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
 func (f *S3Filesystem) Walk(root string, walkFn WalkFunc) error {
@@ -391,11 +499,18 @@ func (f *S3Filesystem) SameFile(fi1, fi2 FileInfo) bool {
 // s3File implements the fs.File interface on top of an S3 object
 type s3File struct {
 	*os.File
-	bucket string
-	name   string
-	client *s3.S3
-	key    string
-	offset int64
+	bucket    string
+	name      string
+	client    *s3.S3
+	key       string
+	offset    int64
+	blockName string
+	size      int64
+}
+
+type s3FileMetadata struct {
+	BlockName string `json:"blockName"`
+	Size      int64  `json:"size"`
 }
 
 func (f *s3File) Name() string {
@@ -409,80 +524,178 @@ func (f *s3File) Close() error {
 
 func (f *s3File) Stat() (FileInfo, error) {
 	fmt.Printf("S3 Stat: %s\n", f.name)
-	return s3stat(f.client, f.bucket, f.key, f.name)
+	stat, err := s3stat(f.client, f.bucket, f.key, f.name)
+
+	if err != nil {
+		return nil, err
+	}
+
+	st := s3FileStat{
+		name:        stat.Name(),
+		size:        f.size,
+		mode:        0777,
+		isDirectory: stat.IsDir(),
+		modTime:     stat.ModTime(),
+	}
+
+	return st, err
+}
+
+type s3Block struct {
+	id     int64
+	key    string
+	file   string
+	bucket string
+	data   []byte
+	dirty  bool
+	start  int64
+	size   int64
+}
+
+// TODO: Block cache optimization
+// Only write blocks when they're full / file is closed
+// Blocks needs to be smarter about internal state then...
+// Also consider what happens if failure; I think it will just retry...
+var blockCache = make(map[string]*s3Block)
+var blockSize = int64(131072)
+
+func FetchBlockFromCache(blockId string) (*s3Block, bool) {
+	b, ok := blockCache[blockId]
+	return b, ok
+}
+
+func CacheBlock(blockId string, block *s3Block) {
+	blockCache[blockId] = block
 }
 
 // Cache these?
-func (f *s3File) FetchBlocks(offset, nBytes int) []byte {
-	startBlock = offset / 128000
-	endBlock = (offset + nBytes) / 128000
+func (f *s3File) FetchBlocks(offset int64, nBytes int) []*s3Block {
+	startBlock := offset / blockSize
+	endBlock := (offset + int64(nBytes) - 1) / blockSize
+	blockCount := (endBlock - startBlock) + 1
+	fmt.Printf("S3 FetchBlocks will pull %d blocks (%d -> %d)\n", blockCount, startBlock, endBlock)
 	downloader := s3manager.NewDownloaderWithClient(f.client)
-	buff := &aws.WriteAtBuffer{}
-	for blockId := startBlock; blockId < endBlock; blockId++ {
-		blockKey := fmt.Sprintf(".blocks/%s.%d", f.key, blockId)
-		fmt.Printf("Fetching block %s\n", blockKey)
+	blocks := make([]*s3Block, 0)
+	for blockId := startBlock; blockId <= endBlock; blockId++ {
+		blockKey := fmt.Sprintf(".blocks/%s.%d", f.blockName, blockId)
+		block, ok := FetchBlockFromCache(blockKey)
+		if !ok {
+			buff := &aws.WriteAtBuffer{}
+			fmt.Printf("Fetching block %s\n", blockKey)
 
-		_, err := downloader.Download(buff, &s3.GetObjectInput{
-			Bucket: aws.String(f.bucket),
-			Key:    aws.String(blockKey),
-		})
+			_, err := downloader.Download(buff, &s3.GetObjectInput{
+				Bucket: aws.String(f.bucket),
+				Key:    aws.String(blockKey),
+			})
 
-		if err != nil {
-			if aerr, ok := err.(awserr.Error); ok {
-				fmt.Printf("Error code getting block: %s\n", aerr.Code())
+			block = &s3Block{
+				id:     blockId,
+				key:    blockKey,
+				file:   f.key,
+				bucket: f.bucket,
+				data:   buff.Bytes(),
+				dirty:  false,
+				start:  blockId * blockSize,
+				size:   blockSize,
 			}
+
+			if err != nil {
+				if aerr, ok := err.(awserr.Error); ok {
+					fmt.Printf("Error code getting block: %s\n", aerr.Code())
+					if aerr.Code() == "NoSuchKey" {
+						fmt.Printf("No such block, creating empty data block!\n")
+						block.data = make([]byte, block.size)
+					}
+				}
+			} else {
+				fmt.Printf("Downloaded block!\n")
+			}
+
+			CacheBlock(blockKey, block)
 		}
+
+		blocks = append(blocks, block)
 	}
 
-	return buff.Bytes()
+	return blocks
 }
 
-func (f *S3File) WriteBlocks(offset int, buf []byte) {
-	startBlock = offset / 128000
-	endBlock = (offset + len(buf)) / 128000
+func (f *s3File) WriteBlocks(blocks []*s3Block) error {
+
+	fmt.Printf("S3 WriteBlocks: %d blocks\n", len(blocks))
+	for _, block := range blocks {
+		fmt.Printf("S3 WriteBlocks: Block ID: %d\n", block.id)
+
+		buffReader := bytes.NewReader(block.data)
+
+		params := &s3.PutObjectInput{
+			Bucket:        aws.String(block.bucket),
+			Key:           aws.String(block.key),
+			Body:          buffReader,
+			ContentLength: aws.Int64(block.size),
+		}
+
+		_, err := f.client.PutObject(params)
+		if err != nil {
+			fmt.Printf("S3 Write bad response: %s", err)
+			return err
+		}
+
+		// Update cache too...
+		CacheBlock(block.key, block)
+
+	}
+
+	return nil
 
 }
 
 // This is stupid; there's no seek / fpntr for these... guess we may need that
 func (f *s3File) Read(buf []byte) (int, error) {
 	fmt.Printf("S3 Read: %s as %s from %s starting at %d\n", f.name, f.key, f.bucket, f.offset)
-	blockBuff := f.FetchBlocks(f.offset, len(buf))
-	numBytes, err := f.ReadAt(buf, f.offset)
-
+	bytesRead, err := f.ReadAt(buf, f.offset)
 	if err != nil {
 		return 0, err
 	}
 
-	/*
-		buff := aws.NewWriteAtBuffer()
-		downloader := s3manager.NewDownloaderWithClient(f.client)
-		numBytes, err := downloader.Download(buff, &s3.GetObjectInput{
-			Bucket: aws.String(f.bucket),
-			Key:    aws.String(f.key),
-		})*/
-	fmt.Printf("S3 Read %d bytes -- buffer is %d in size\n", numBytes, len(buf))
-	f.offset = f.offset + int64(numBytes)
-	fmt.Printf("Offset is now %d\n", f.offset)
+	f.offset = f.offset + int64(bytesRead)
+	return bytesRead, nil
+}
 
-	return int(numBytes), err
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (f *s3File) ReadAt(buf []byte, off int64) (n int, err error) {
-	fmt.Printf("S3 ReadAt: %s\n", f.name)
-	bytes := len(buf)
-	endByte := off + int64(bytes)
-	rangeValue := fmt.Sprintf("bytes=%d-%d", off, endByte-1)
-	fmt.Printf("RANGE: %s\n", rangeValue)
-	buff := aws.NewWriteAtBuffer(buf)
-	downloader := s3manager.NewDownloaderWithClient(f.client)
-	numBytes, err := downloader.Download(buff, &s3.GetObjectInput{
-		Bucket: aws.String(f.bucket),
-		Key:    aws.String(f.key),
-		Range:  aws.String(rangeValue),
-	})
-	fmt.Printf("S3 Read %d bytes\n", numBytes)
+	dataLen := int64(len(buf))
+	fmt.Printf("S3 ReadAt: %s from %d to %d\n", f.name, off, off+dataLen)
+	blocks := f.FetchBlocks(off, len(buf))
+	nextOffset := off
+	bufOffset := 0
+	bytesRead := 0
+	bytesReadInBlock := 0
+	for _, block := range blocks {
+		fmt.Printf("Reading from block: %s (start: %d, size: %d)\n", block.key, block.start, block.size)
+		start := nextOffset - block.start
+		nextOffset = block.start + block.size
+		bytesInBlockToRead := min(dataLen-int64(bytesReadInBlock), block.size-start) //min(int64(len(buf)), block.size-start)
+		end := start + bytesInBlockToRead
 
-	return int(numBytes), err
+		fmt.Printf("Reading range from %d -> %d\n", start, end)
+		fmt.Printf("NextOffset: %d, BytesInBlockToRead: %d\n", nextOffset, bytesInBlockToRead)
+		for _, b := range block.data[start:end] {
+			buf[bufOffset] = b
+			bufOffset++
+			bytesRead++
+			bytesReadInBlock++
+		}
+	}
+
+	fmt.Printf("S3 ReadAt read %d bytes across %d blocks\n", bytesRead, len(blocks))
+	return int(bytesRead), err
 }
 
 func (f *s3File) Seek(offset int64, whence int) (ret int64, err error) {
@@ -498,59 +711,95 @@ func (f *s3File) Truncate(size int64) error {
 	return nil
 }
 
-func (f *s3File) Write(buff []byte) (n int, err error) {
-	fmt.Printf("S3 Write: %s\n", f.name)
-	dataLen := len(buff)
-	buffReader := bytes.NewReader(buff)
-
+func (f *s3File) WritePlaceholder() error {
+	emptyBytes := make([]byte, 0)
+	buffReader := bytes.NewReader(emptyBytes)
 	params := &s3.PutObjectInput{
 		Bucket:        aws.String(f.bucket),
 		Key:           aws.String(f.key),
 		Body:          buffReader,
-		ContentLength: aws.Int64(int64(dataLen)),
+		ContentLength: aws.Int64(int64(0)),
+	}
+	_, err := f.client.PutObject(params)
+
+	return err
+}
+
+func (f *s3File) WriteMetadata() error {
+	metadataKey := fmt.Sprintf(".metadata/%s", f.key)
+
+	metadata := s3FileMetadata{
+		BlockName: f.blockName,
+		Size:      f.size,
 	}
 
+	fmt.Printf("Metadata to write: %s\n", metadata)
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		fmt.Println("error serializing:", err)
+	}
+	fmt.Printf("Metadata bytes to write: %s\n", metadataBytes)
+	fmt.Printf("Writing pointer for %s -> %s -- len: %d\n", f.key, metadataKey, len(metadataBytes))
+	buffReader := bytes.NewReader(metadataBytes)
+	params := &s3.PutObjectInput{
+		Bucket:        aws.String(f.bucket),
+		Key:           aws.String(metadataKey),
+		Body:          buffReader,
+		ContentLength: aws.Int64(int64(len(metadataBytes))),
+	}
 	_, err = f.client.PutObject(params)
 	if err != nil {
 		fmt.Printf("S3 Write bad response: %s", err)
-		return 0, err
+		return err
 	}
+	return nil
+}
 
-	return dataLen, nil
-
+func (f *s3File) Write(buff []byte) (n int, err error) {
+	fmt.Printf("S3 Write: %s\n", f.name)
+	return f.WriteAt(buff, f.offset)
 }
 
 // TODO: Optimize this by instead writing files as blocks so we don't need
 // to fetch the whole thing and overwrite part of it; this whole thing is terribly ineffective...
 func (f *s3File) WriteAt(buff []byte, off int64) (n int, err error) {
 	dataLen := len(buff)
-	end := int(off) + int(dataLen)
+	blocks := f.FetchBlocks(off, dataLen)
+	end := int64(off) + int64(dataLen)
 	fmt.Printf("S3 WriteAt: %s %d-%d (%d bytes)\n", f.name, off, end, dataLen)
+	bytesWritten := 0
+	/*
+		block start = initial offset + bytes written - block starting byte
+		bytes to write in block = smaller of (bytes in buffer - bytes written so far) or all remaining bytes in the block
+		block end = block start + bytes to write in block
 
-	if !f.Exists() {
-		f.Write(buff)
-	} else {
-		wab := &aws.WriteAtBuffer{}
-		downloader := s3manager.NewDownloaderWithClient(f.client)
-		numBytes, err := downloader.Download(wab, &s3.GetObjectInput{
-			Bucket: aws.String(f.bucket),
-			Key:    aws.String(f.key),
-		})
 
-		if err != nil {
-			return 0, err
+	*/
+	for _, block := range blocks {
+		fmt.Printf("Writing to block: %d\n", block.id)
+		blockStart := (off + int64(bytesWritten)) - block.start
+		bytesInBlockToWrite := min(int64(dataLen-bytesWritten), block.size-blockStart)
+		blockEnd := blockStart + bytesInBlockToWrite
+		fmt.Printf("Block range: %d -> %d, Block size: %d\n", blockStart, blockEnd, block.size)
+		fmt.Printf("Writing %d bytes\n", bytesInBlockToWrite)
+		for i := int64(0); i < bytesInBlockToWrite; i++ {
+			block.data[blockStart+i] = buff[bytesWritten]
+			bytesWritten++
 		}
-		fmt.Printf("S3 WriteAt Read %d bytes\n", numBytes)
-		fmt.Printf("Writing %d - %d\n", off, end)
-		wab.WriteAt(buff, off)
-		f.Write(wab.Bytes())
 	}
+
+	f.WriteBlocks(blocks)
+
+	if f.size < end {
+		f.size = end
+	}
+
 	return dataLen, nil
 }
 
 func (f *s3File) Exists() bool {
 
-	fmt.Printf("Checking if %s exists\n", f.key)
+	fmt.Printf("Checking if %s exists...", f.key)
 
 	_, err := f.client.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(f.bucket),
@@ -559,9 +808,12 @@ func (f *s3File) Exists() bool {
 
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "NotFound" {
+			fmt.Printf(" Nope!\n")
 			return false
 		}
 	}
+
+	fmt.Printf(" Yep!\n")
 
 	return true
 }
@@ -625,22 +877,25 @@ func s3stat(client *s3.S3, bucket, key, name string) (FileInfo, error) {
 	})
 
 	if err != nil {
-		fmt.Printf("Error getting head for %s\n", key)
 		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == "NotFound" {
 			return nil, os.ErrNotExist
 		}
 
+		fmt.Printf("Unhandled error getting head for %s: %s\n", key, err)
 		return nil, err
 	}
 
-	stat := s3FileStat{
+	return s3FileStat{
 		name:        name,
 		size:        *headObj.ContentLength,
 		mode:        0777,
 		isDirectory: keyIsDirectory,
 		modTime:     *headObj.LastModified,
-	}
+	}, nil
+}
 
-	fmt.Printf("Result: %s\n", stat)
-	return stat, nil
+func GetMD5Hash(text string) string {
+	hasher := md5.New()
+	hasher.Write([]byte(text))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
